@@ -47,9 +47,15 @@ typedef enum {
 	OP_READ 
 } op_t;
 
+typedef enum {
+	RESULT_OK,
+	RESULT_ERR
+} result_t;
+
 /* glorious god object that holds the state of everything in this program; tldr */
 typedef struct {
 	op_t cur_op; 
+	result_t cur_result;
 
 	UBYTE *cp;
 
@@ -57,8 +63,11 @@ typedef struct {
 	LONG sigmask_intr;
 	struct Task *MainTask;
 
+	UBYTE *buf;
+	ULONG buf_size;
+	ULONG bytes_count;
+
 	UBYTE slave_addr; 
-	UBYTE bytes_left;
 #ifdef DEBUG
 	int isr_called; /* how may times ISR was called */
 	BOOL in_isr;
@@ -71,7 +80,7 @@ __amigainterrupt void pca9564_isr(pca9564_state_t *);
 void pca9564_dump_state(pca9564_state_t *);
 void pca9564_send_start(pca9564_state_t *);
 /*void pca9564_send_stop(void); XXX */
-void pca9564_read_1(pca9564_state_t *, UBYTE);
+void pca9564_read(pca9564_state_t *, UBYTE, ULONG, UBYTE **);
 
 UBYTE
 clockport_read(pca9564_state_t *sp, UBYTE reg) 
@@ -109,6 +118,10 @@ int main(void)
 	struct Interrupt *int6;
 
 	UBYTE ctrl;
+	UBYTE *buf;
+	UBYTE size;
+
+	size = 2;
 
 #ifdef DEBUG
 	sc.in_isr = FALSE;
@@ -140,62 +153,67 @@ int main(void)
 		return 1;
 	}
 
+	if (!(buf = AllocMem(size, MEMF_PUBLIC|MEMF_CLEAR))) {
+		printf("Not enough memory to allocate the buffer\n");
+		/* XXX: clean up */
+	} 
+
 	/* init the host controller */
 	ctrl = I2CCON_CR_59KHZ | I2CCON_ENSIO;
 	clockport_write(&sc, I2CCON, ctrl);
 	Delay(50);
 
-	pca9564_read_1(&sc, 0x48); 	/* XXX */
+	/* read 2 bytes from 0x48 */
+	pca9564_read(&sc, 0x48, size, &buf); 	/* XXX */
+
+	printf("read result: %u, %u\n", buf[0], buf[1]);
 
 	ctrl = 0;
 	clockport_write(&sc, I2CCON, ctrl);
 
+	FreeMem(buf, size);
+
 	RemIntServer(INTB_EXTER, int6);
 	FreeMem(int6, sizeof(struct Interrupt));
 	FreeSignal(sc.sig_intr);
-
+#ifdef DEBUG 
 	printf("ISR was called %d times\n", sc.isr_called);
+#endif /* DEBUG */
     
-    return 0;
+	return 0;
 }
 
 void
-pca9564_read_1(pca9564_state_t *sp, UBYTE address)
+pca9564_read(pca9564_state_t *sp, UBYTE address, ULONG size, UBYTE **buf)
 {
 	/*assert(cur_op == OP_NOP);
 	assert(address > 1);*/
 
 	sp->cur_op = OP_READ;
 	sp->slave_addr = address;
-	sp->bytes_left = 1;
+	sp->buf_size = size;
+	sp->bytes_count = 0;
+	sp->buf = *buf;
 
-	printf("gonna send start\n");
+	printf("OP_READ: send start\n");
 	pca9564_send_start(sp);
 
 	Wait(sp->sigmask_intr);
 
-	Delay(10);
-	pca9564_dump_state(sp);
-/*
-	printf("gonna send stop\n");
-	pca9564_send_stop();
-	pca9564_dump_state();
-*/
+	if (sp->cur_result != RESULT_OK) {
+		printf("OP_READ: failed!\n");	
+		pca9564_dump_state(sp);
+	}
+#ifdef DEBUG
+	else {
+		printf("OP_READ: successful!\n");
+		pca9564_dump_state(sp);
+	}
+#endif /* DEBUG */
 
 	sp->slave_addr = 0;
 	sp->cur_op = OP_NOP;
 }
-
-/*void
-pca9564_send_stop(void)
-{
-	UBYTE c;
-
-	c = clockport_read(I2CCON);
-	c |= I2CCON_STO;
-	c &= (I2CCON_STA);
-	clockport_write(I2CCON, c);	
-}*/
 
 void
 pca9564_send_start(pca9564_state_t *sp) 
@@ -245,25 +263,53 @@ pca9564_isr(__reg("a1") pca9564_state_t *sp)
 			break;
 		case I2CSTA_SLAR_TX_ACK_RX:	/* 0x40 */
 			v = clockport_read(sp, I2CCON);
-			v &= ~(I2CCON_SI|I2CCON_AA); /*XXX: last byte */
+			v &= ~(I2CCON_SI);
+
+			if ((sp->bytes_count+1) < sp->buf_size) 
+				v |= (I2CCON_AA);
+			else
+				v &= ~(I2CCON_AA); /* last byte */
+
+			clockport_write(sp, I2CCON, v);
+			break;
+		case I2CSTA_DATA_RX_ACK_TX:	/* 0x50 */
+			sp->buf[sp->bytes_count] = clockport_read(sp, I2CDAT);
+			(sp->bytes_count)++;
+
+			v = clockport_read(sp, I2CCON);
+			v &= ~(I2CCON_SI);
+
+			if ((sp->bytes_count+1) < sp->buf_size) 
+				v |= (I2CCON_AA);
+			else
+				v &= ~(I2CCON_AA); /* last byte */
+
 			clockport_write(sp, I2CCON, v);
 			break;
 		case I2CSTA_DATA_RX_NACK_TX:	/* 0x58 */
+			sp->buf[sp->bytes_count] = clockport_read(sp, I2CDAT);
+			(sp->bytes_count)++;
+
 			v = clockport_read(sp, I2CCON);
 			v &= ~(I2CCON_SI);
-			v |= (I2CCON_AA|I2CCON_STO);
+			v |= (I2CCON_AA|I2CCON_STO);	/* send stop */
+
 			clockport_write(sp, I2CCON, v);
+
+			sp->cur_result = RESULT_OK;
 			Signal(sp->MainTask, sp->sigmask_intr);
 			break;
 		default:
-			/* insert error handler here */
 			clockport_write(sp, I2CCON, 0);
+			sp->cur_result = RESULT_ERR;
+			Signal(sp->MainTask, sp->sigmask_intr);
 			break;
 		}
 		break;
 	case OP_NOP:
-		/* insert error handler here */
 		clockport_write(sp, I2CCON, 0);
+		sp->cur_result = RESULT_ERR;
+		Signal(sp->MainTask, sp->sigmask_intr);
 		break;
 	}
 
