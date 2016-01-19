@@ -33,10 +33,16 @@
 #define I2CCON_AA		(1 << 7)
 
 #define I2CSTA_START_SENT	0x08
+
 #define I2CSTA_SLAR_TX_ACK_RX	0x40
 #define I2CSTA_SLAR_TX_NACK_RX	0x48
 #define I2CSTA_DATA_RX_ACK_TX	0x50
 #define I2CSTA_DATA_RX_NACK_TX	0x58
+
+#define I2CSTA_SLAW_TX_ACK_RX	0x18
+#define I2CSTA_SLAW_TX_NACK_RX	0x20
+#define I2CSTA_DATA_TX_ACK_RX	0x28
+#define I2CSTA_DATA_TX_NACK_RX	0x30
 
 #define I2CSTA_IDLE		0xF8
 
@@ -44,7 +50,8 @@
 
 typedef enum { 
 	OP_NOP,	
-	OP_READ 
+	OP_READ,
+	OP_WRITE
 } op_t;
 
 typedef enum {
@@ -79,8 +86,9 @@ void clockport_write(pca9564_state_t *, UBYTE, UBYTE);
 __amigainterrupt void pca9564_isr(pca9564_state_t *);
 void pca9564_dump_state(pca9564_state_t *);
 void pca9564_send_start(pca9564_state_t *);
-/*void pca9564_send_stop(void); XXX */
 void pca9564_read(pca9564_state_t *, UBYTE, ULONG, UBYTE **);
+void pca9564_write(pca9564_state_t *, UBYTE, ULONG, UBYTE **);
+void pca9564_exec(pca9564_state_t *, UBYTE, ULONG, UBYTE **);
 
 UBYTE
 clockport_read(pca9564_state_t *sp, UBYTE reg) 
@@ -163,6 +171,8 @@ int main(void)
 	clockport_write(&sc, I2CCON, ctrl);
 	Delay(50);
 
+	buf[0] = 0x2;
+	pca9564_write(&sc, 0x48, 1, &buf); 	/* XXX */
 	/* read 2 bytes from 0x48 */
 	pca9564_read(&sc, 0x48, size, &buf); 	/* XXX */
 
@@ -176,6 +186,7 @@ int main(void)
 	RemIntServer(INTB_EXTER, int6);
 	FreeMem(int6, sizeof(struct Interrupt));
 	FreeSignal(sc.sig_intr);
+
 #ifdef DEBUG 
 	printf("ISR was called %d times\n", sc.isr_called);
 #endif /* DEBUG */
@@ -184,35 +195,46 @@ int main(void)
 }
 
 void
+pca9564_write(pca9564_state_t *sp, UBYTE address, ULONG size, UBYTE **buf)
+{
+	sp->cur_op = OP_WRITE;
+	pca9564_exec(sp, address, size, buf);
+	sp->cur_op = OP_NOP;
+}
+
+void
 pca9564_read(pca9564_state_t *sp, UBYTE address, ULONG size, UBYTE **buf)
 {
-	/*assert(cur_op == OP_NOP);
-	assert(address > 1);*/
-
 	sp->cur_op = OP_READ;
+	pca9564_exec(sp, address, size, buf);
+	sp->cur_op = OP_NOP;
+}
+
+void
+pca9564_exec(pca9564_state_t *sp, UBYTE address, ULONG size, UBYTE **buf)
+{
 	sp->slave_addr = address;
 	sp->buf_size = size;
 	sp->bytes_count = 0;
 	sp->buf = *buf;
 
-	printf("OP_READ: send start\n");
 	pca9564_send_start(sp);
 
 	Wait(sp->sigmask_intr);
 
 	if (sp->cur_result != RESULT_OK) {
-		printf("OP_READ: failed!\n");	
+		printf("OP: failed!\n");	
 		pca9564_dump_state(sp);
 	}
 #ifdef DEBUG
 	else {
-		printf("OP_READ: successful!\n");
+		printf("OP: successful!\n");
 		pca9564_dump_state(sp);
 	}
 #endif /* DEBUG */
 
+	sp->buf_size = 0;
 	sp->slave_addr = 0;
-	sp->cur_op = OP_NOP;
 }
 
 void
@@ -298,6 +320,47 @@ pca9564_isr(__reg("a1") pca9564_state_t *sp)
 
 			sp->cur_result = RESULT_OK;
 			Signal(sp->MainTask, sp->sigmask_intr);
+			break;
+		default:
+			clockport_write(sp, I2CCON, 0);
+			sp->cur_result = RESULT_ERR;
+			Signal(sp->MainTask, sp->sigmask_intr);
+			break;
+		}
+		break;
+	case OP_WRITE:
+		switch (clockport_read(sp, I2CSTA)) {
+		case I2CSTA_START_SENT:		/* 0x08 */
+			clockport_write(sp, I2CDAT, (sp->slave_addr << 1) | 0);
+			v = clockport_read(sp, I2CCON);
+			v &= ~(I2CCON_SI|I2CCON_STA); 
+			clockport_write(sp, I2CCON, v);
+			break;
+		case I2CSTA_SLAW_TX_ACK_RX:	/* 0x18 */
+			clockport_write(sp, I2CDAT, sp->buf[sp->bytes_count]);
+			v = clockport_read(sp, I2CCON);
+			v &= ~(I2CCON_SI);
+			clockport_write(sp, I2CCON, v);
+			break;
+		case I2CSTA_DATA_TX_ACK_RX:	/* 0x28 */
+			v = clockport_read(sp, I2CCON);
+
+			if (sp->bytes_count+1 < sp->buf_size) {
+				clockport_write(sp, I2CDAT, sp->buf[sp->bytes_count]);
+
+			} else {
+				v |= (I2CCON_STO);
+			}
+			(sp->bytes_count)++;
+
+			v &= ~(I2CCON_SI);
+			clockport_write(sp, I2CCON, v);
+
+			if (sp->bytes_count == sp->buf_size) {
+				sp->cur_result = RESULT_OK;
+				Signal(sp->MainTask, sp->sigmask_intr);
+			}
+
 			break;
 		default:
 			clockport_write(sp, I2CCON, 0);
