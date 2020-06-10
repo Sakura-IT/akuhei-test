@@ -345,13 +345,13 @@ pca9564_isr(__reg("a1") pca9564_state_t *sp)
 		case I2CSTA_DATA_TX_ACK_RX:	/* 0x28 */
 			v = clockport_read(sp, I2CCON);
 
-			if (sp->bytes_count+1 < sp->buf_size) {
+			(sp->bytes_count)++;
+			if (sp->bytes_count < sp->buf_size) {
 				clockport_write(sp, I2CDAT, sp->buf[sp->bytes_count]);
 
 			} else {
 				v |= (I2CCON_STO);
 			}
-			(sp->bytes_count)++;
 
 			v &= ~(I2CCON_SI);
 			clockport_write(sp, I2CCON, v);
